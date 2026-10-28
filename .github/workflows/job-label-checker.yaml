@@ -1,0 +1,150 @@
+name: Label Checker
+# Every PR must carry a categorizing label. This workflow derives the label from
+# the conventional-commit PR title and applies it, then confirms it is present.
+#
+# Labeling and the check live in ONE workflow on purpose. The label is applied
+# with the default GITHUB_TOKEN, and GitHub does not fire new workflow events
+# (e.g. `labeled`) from GITHUB_TOKEN actions, so a separate checker keyed on the
+# `labeled` event would never re-run after the label was added and would stay
+# failed on a fresh PR. Running the check as a job that `needs` the autolabel job
+# guarantees the label is applied in the same run.
+#
+# The label is applied deterministically rather than relying on release-drafter's
+# autolabeler, which does not reliably apply labels in this configuration. The
+# release-drafter.yml autolabeler block is still used at draft time; this job is
+# what guarantees a categorizing label on every PR.
+#
+# Both jobs call the Issues API through actions/github-script rather than the gh
+# CLI: github-script carries its own GitHub client, so the jobs don't depend on
+# what the runner image ships.
+#
+# Draft PRs are skipped; the label is applied when the PR is marked ready. The
+# label comes from the title, so this workflow keeps `edited` (a retitled PR is
+# relabeled); the build and security workflows do not react to edits.
+on:
+  pull_request:
+    types: [opened, reopened, edited, synchronize, ready_for_review]
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  autolabel:
+    name: 🏷️ Autolabel
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The addLabels call below targets the Issues API (a PR's labels live under
+    # /issues/{number}/labels), so this needs issues:write. On a PR, GitHub's own
+    # x-accepted-github-permissions response header says that alone is still not
+    # enough: it also requires pull-requests:write, together, for the same call.
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      # Map the conventional-commit prefix in the PR title to a categorizing
+      # label and apply it. Best-effort (continue-on-error): the
+      # categorizing-label job below is the authoritative check.
+      - name: Apply label from PR title
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            // Derive the label from the conventional-commit type/prefix. The
+            // first pattern already covers every `<type>!:` and
+            // `<type>(scope)!:` title, feat included, so there is no separate
+            // feat-breaking arm.
+            const title = context.payload.pull_request.title;
+            let label = "";
+            if (/!:/.test(title) || /BREAKING[ -]CHANGE/.test(title)) {
+              label = "breaking";
+            } else if (/^feat(\(.*\))?:/.test(title)) {
+              label = "enhancement";
+            } else if (/^fix(\(.*\))?:/.test(title)) {
+              label = "fix";
+            } else if (/^perf(\(.*\))?:/.test(title)) {
+              label = "performance";
+            } else if (/^refactor(\(.*\))?:/.test(title)) {
+              label = "refactor";
+            } else if (/^docs(\(.*\))?:/.test(title)) {
+              label = "documentation";
+            } else if (/^security(\(.*\))?:/.test(title)) {
+              label = "security";
+            } else if (/^build(\(.*\))?:/.test(title) || /^chore\(deps.*\):/.test(title)) {
+              label = "dependencies";
+            } else if (/^(ci|test|style|chore)(\(.*\))?:/.test(title)) {
+              label = "skip-changelog";
+            } else {
+              core.info("PR title is not a recognized conventional-commit type; leaving labels alone.");
+              return;
+            }
+            core.info(`Applying label: ${label}`);
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              labels: [label],
+            });
+
+  categorizing-label:
+    name: ✅ Categorizing label present
+    needs: [autolabel]
+    # Run even if autolabel was skipped/failed; the label may already be present
+    # from the PR title. Drafts are still skipped.
+    if: always() && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Reading labels is the Issues API (a PR's labels live under
+    # /issues/{number}/labels), so this needs issues:read. On a PR, GitHub's own
+    # x-accepted-github-permissions response header says that alone is still not
+    # enough: it also requires pull-requests:read, together, for the same call.
+    # On a private repo the API call 403s without both, and that used to be
+    # hidden by a swallowed error, which made a permissions bug look like "no
+    # label".
+    permissions:
+      issues: read
+      pull-requests: read
+    steps:
+      # Poll the LIVE labels via the API rather than the trigger payload. The
+      # autolabel job above applies the label with the default GITHUB_TOKEN; that
+      # write takes a moment to be visible, and the `opened` event payload this
+      # run was triggered with never carries it. Retrying against the API closes
+      # that race so a fresh PR passes on the first run instead of needing a rerun.
+      - name: Verify a categorizing label is present
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const allowed = new Set([
+              "breaking", "enhancement", "bug", "fix", "performance", "refactor",
+              "changed", "deprecated", "removed", "security", "documentation",
+              "dependencies", "skip-changelog",
+            ]);
+            const pr = context.payload.pull_request.number;
+            for (let attempt = 1; attempt <= 6; attempt++) {
+              // Only retry when the call itself succeeds but the label isn't
+              // visible yet (the autolabel race). A failed call (bad
+              // permissions, 403/404, etc.) is a real error, not a race, so it
+              // fails the job immediately instead of being retried.
+              let names;
+              try {
+                const res = await github.rest.issues.listLabelsOnIssue({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pr,
+                });
+                names = res.data.map((l) => l.name);
+              } catch (err) {
+                core.setFailed(`listLabelsOnIssue for PR #${pr} failed: ${err.message}`);
+                return;
+              }
+              const found = names.find((n) => allowed.has(n));
+              if (found) {
+                core.info(`Found categorizing label: ${found}`);
+                return;
+              }
+              core.info(`No categorizing label yet (attempt ${attempt}/6); waiting for the autolabeler...`);
+              if (attempt < 6) await new Promise((r) => setTimeout(r, 10000));
+            }
+            core.setFailed(`No categorizing label present. Add one of: ${[...allowed].join(" ")}`);

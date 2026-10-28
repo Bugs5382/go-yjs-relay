@@ -1,0 +1,26 @@
+name: Release Drafter
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  update_release_draft:
+    name: 📝 Update Release Draft
+    permissions:
+      contents: write
+      pull-requests: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Draft release notes
+        uses: Bugs5382/release-drafter-action@de0c4559d69039b8b371ef951b62a2532ad3593f # v1.0.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config: ${{ vars.RELEASE_DRAFTER_CONFIG }}
+          extends: ${{ github.repository_owner == 'Bugs5382' && 'Bugs5382/.github@main' || '' }}
