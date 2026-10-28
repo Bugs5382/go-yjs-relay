@@ -7,34 +7,38 @@ hook-enforced rules). Keep this file current when the build, layout, or public A
 
 A product-neutral Yjs relay for Go: per-room y-websocket sync, presence fan-out, debounced snapshots, and flush and freeze around a publish.
 
-<!-- Fill in: what the project does, what it ships (library, service, action, CLI), and the one or
-two things an agent must understand before changing it. -->
+The relay runs no Y.Doc: updates fan out to peers verbatim and clients converge on their own.
+Durability comes from a client snapshot frame (content export plus compacted Yjs state) that each
+room debounces and hands to a caller-supplied `SnapshotSink`. Joins are checked by a caller-supplied
+`TokenVerifier`. Keep the library product-neutral: no JWT, database, broker or RPC code here.
 
 ## Using go-yjs-relay
 
-<!-- If this project is consumed by others (a library/plugin/action), describe the contract a
-consumer must respect: the single entry point, the public surface, required options, and anything
-that must not be bypassed. Delete this section for a leaf application. -->
+- Entry points: `yjsrelay.New(sink, opts...)` returns the `*Hub`; `yjsrelay.NewHandler(hub, verifier)`
+  is the `http.Handler` clients connect to.
+- Caller interfaces: `TokenVerifier` (returns a `Join`: room, `Identity`, room attrs) and
+  `SnapshotSink` (`Load`, `Save`). Optional: `SessionObserver`.
+- Publish flow: `Hub.Flush` before a publish (blocks until the sink answers; a `*FlushError` means do
+  not publish), `Hub.Freeze` after it. `Hub.Lookup` and `Hub.RoomCount` never open a room.
+- Errors: `ErrRejected`, `ErrUnavailable`, `ErrClosed`, `*RejectError` (a sink's client-visible
+  refusal), `*FlushError`. go-apperr codes are the caller's, through `WithCodes`.
+- The wire format lives in `protocol/`; its fixtures in `protocol/yprotocols_test.go` came from the
+  real JavaScript stack and must not be regenerated from this package.
 
 ## Layout
 
-<!-- The directories that matter and what lives in each. Keep it short; point at the entry points. -->
-
-- `src/` - <what>
-- `<tests dir>/` - <what>
+- `*.go` (root) - hub, room, client, handler, the caller interfaces, options and errors
+- `protocol/` - y-websocket and extension frame encoders and decoders
+- `internal/debounce/` - the snapshot debouncer
+- `*_test.go` - black-box tests over a real socket (`helpers_test.go` has the fakes);
+  `resync_internal_test.go` covers the few paths a socket cannot drive deterministically
 
 ## Build, test, lint
 
-<!-- The exact commands. Pull these from package.json scripts (npm), the Taskfile (Go/Task), or
-pyproject (Python) so they stay accurate. -->
-
-- Build: `<command>`
-- Test: `<command>` (note any service/fixture the integration tests require)
-- Lint: `<command>`
-- Package checks (npm packages), after a build: `npm run check:pack` (contents and ceiling),
-  `npm run check:pack:growth` (growth against the last release), `npm run check:install`
-  (install the tarball, import ESM and CJS); see CLAUDE.md "npm package contents"
-- License headers / docs: `<command>`
+- Build: `task build`
+- Test: `task test` (hermetic; no services needed)
+- Lint: `task lint`
+- License headers: `task license` (check) and `task license:fix`
 
 ## Logging
 
@@ -56,4 +60,7 @@ Follow the logging rules in `CLAUDE.md`. In short:
   `.claude/hooks` (run `bash .claude/hooks/install.sh` once per clone).
 - Open every PR as a draft. CI skips drafts, so run the full checks locally, push once they pass,
   and mark the PR ready when the work is finished; see CLAUDE.md "CI and Actions minutes".
-- <project-specific conventions, non-obvious constraints, and traps an agent should know>
+- Never decode or merge Yjs on the server, and never save per update: state changes only on a
+  snapshot. A zero-length update or Sync Step-2 payload is invalid Yjs; use
+  `protocol.EmptyDocumentUpdate`.
+- Never log tokens or display names. User ids are logged as opaque ids.
